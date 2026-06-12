@@ -2,7 +2,9 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
-from plugins.alerts import on_failure_alert
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'plugins'))
+from alerts import on_failure_alert
 
 default_args = {
     "owner": "data_engineering",
