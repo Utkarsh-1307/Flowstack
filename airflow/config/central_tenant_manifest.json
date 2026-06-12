@@ -1,0 +1,20 @@
+[
+  {
+    "client_id": "nike",
+    "schedule": "0 * * * *",
+    "target_table": "analytics_nike",
+    "retention_days": 90
+  },
+  {
+    "client_id": "puma",
+    "schedule": "*/30 * * * *",
+    "target_table": "analytics_puma",
+    "retention_days": 180
+  },
+  {
+    "client_id": "adidas",
+    "schedule": "0 */2 * * *",
+    "target_table": "analytics_adidas",
+    "retention_days": 365
+  }
+]

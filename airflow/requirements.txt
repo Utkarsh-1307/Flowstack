@@ -1,0 +1,5 @@
+apache-airflow-providers-slack==8.6.0
+apache-airflow-providers-postgres==5.10.2
+requests==2.31.0
+pyarrow==16.0.0
+asyncpg==0.29.0

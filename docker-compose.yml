@@ -1,0 +1,242 @@
+services:
+  # ─── Storage ────────────────────────────────────────────────────────────────
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: production_postgres
+    environment:
+      POSTGRES_DB: analytics_platform
+      POSTGRES_USER: engine_admin
+      POSTGRES_PASSWORD: ${DATABASE_SECURE_PASSWORD}
+    volumes:
+      - pg_data_store:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engine_admin -d analytics_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data_platform_network
+
+  # ─── Kafka (KRaft mode — no Zookeeper) ──────────────────────────────────────
+  kafka-broker:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: production_kafka
+    ports:
+      - "9093:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-broker:29093'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-broker:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka-broker:29092,CONTROLLER://kafka-broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data_platform_network
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi_gateway
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    env_file: .env
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      kafka-broker:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data:/data
+    networks:
+      - data_platform_network
+
+  # ─── Spark Cluster ───────────────────────────────────────────────────────────
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark_master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+    ports:
+      - "8082:8080"   # Spark Web UI
+      - "7077:7077"   # Spark Master port
+    volumes:
+      - ./data:/data
+      - ./spark/apps:/opt/spark/apps
+    networks:
+      - data_platform_network
+
+  spark-worker-1:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark_worker_1
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      - spark-master
+    volumes:
+      - ./data:/data
+      - ./spark/apps:/opt/spark/apps
+    networks:
+      - data_platform_network
+
+  spark-worker-2:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark_worker_2
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      - spark-master
+    volumes:
+      - ./data:/data
+      - ./spark/apps:/opt/spark/apps
+    networks:
+      - data_platform_network
+
+  # ─── Airflow ─────────────────────────────────────────────────────────────────
+  airflow-init:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@flowstack.local \
+          --password admin
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://engine_admin:${DATABASE_SECURE_PASSWORD}@postgres-db:5432/analytics_platform
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    networks:
+      - data_platform_network
+
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow_webserver
+    command: webserver
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://engine_admin:${DATABASE_SECURE_PASSWORD}@postgres-db:5432/analytics_platform
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8080"   # Airflow UI
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/config:/opt/airflow/config
+      - ./data:/data
+    networks:
+      - data_platform_network
+
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: airflow_scheduler
+    command: scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://engine_admin:${DATABASE_SECURE_PASSWORD}@postgres-db:5432/analytics_platform
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/config:/opt/airflow/config
+      - ./data:/data
+    networks:
+      - data_platform_network
+
+  # ─── Frontend ────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: react_dashboard
+    ports:
+      - "3001:80"
+    depends_on:
+      - api-gateway
+    networks:
+      - data_platform_network
+
+  # ─── Nginx Reverse Proxy ─────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx_proxy
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8090:80"
+    depends_on:
+      - api-gateway
+      - frontend
+    networks:
+      - data_platform_network
+
+networks:
+  data_platform_network:
+    driver: bridge
+
+volumes:
+  pg_data_store:
