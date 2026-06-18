@@ -49,26 +49,6 @@ services:
     networks:
       - data_platform_network
 
-  # ─── API Gateway ─────────────────────────────────────────────────────────────
-  api-gateway:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: fastapi_gateway
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
-    env_file: .env
-    depends_on:
-      postgres-db:
-        condition: service_healthy
-      kafka-broker:
-        condition: service_healthy
-    ports:
-      - "8001:8000"
-    volumes:
-      - ./data:/data
-    networks:
-      - data_platform_network
-
   # ─── Spark Cluster ───────────────────────────────────────────────────────────
   spark-master:
     build:
@@ -173,7 +153,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
     ports:
-      - "8083:8080"   # Airflow UI
+      - "8080:8080"   # Airflow UI
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
@@ -204,33 +184,6 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./airflow/config:/opt/airflow/config
       - ./data:/data
-    networks:
-      - data_platform_network
-
-  # ─── Frontend ────────────────────────────────────────────────────────────────
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: react_dashboard
-    ports:
-      - "3001:80"
-    depends_on:
-      - api-gateway
-    networks:
-      - data_platform_network
-
-  # ─── Nginx Reverse Proxy ─────────────────────────────────────────────────────
-  nginx:
-    image: nginx:1.25-alpine
-    container_name: nginx_proxy
-    volumes:
-      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - "8090:80"
-    depends_on:
-      - api-gateway
-      - frontend
     networks:
       - data_platform_network
 

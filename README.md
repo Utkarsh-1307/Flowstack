@@ -1,39 +1,30 @@
 # FlowStack — Real-Time ETL & Analytics Platform
 
-A production-grade, end-to-end data engineering platform built from scratch. Covers real-time event ingestion, stream processing, distributed batch computation, workflow orchestration, and a live analytics dashboard.
+A production-grade data engineering platform built from scratch. Covers real-time stream ingestion, distributed batch computation, workflow orchestration, data quality, monitoring, and multi-tenant reporting — all driven by Apache Airflow.
 
 ---
 
 ## Architecture
 
 ```
-[ React Dashboard ]
-        │
-        │ HTTP POST / WebSocket
-        ▼
-[ FastAPI Gateway ]
-        │
-        │ Produce Event
-        ▼
 [ Apache Kafka ]
         │
-   ┌────┴────┐
-   ▼         ▼
-[ Spark     [ MinIO / Local
-  Streaming]   Data Lake ]
-   │              │
-   ▼              ▼
-[ Postgres   [ Airflow
-  Live DB ]    Orchestrator ]
-                  │
-                  ▼
-           [ Spark Batch Job ]
-                  │
-                  ▼
-         [ Postgres Gold Layer ]
+   ┌────┴────────────────────┐
+   ▼                         ▼
+[ Spark Structured       [ Airflow Scheduler ]
+  Streaming ]                │
+   │                         │ Triggers
+   ▼                         ▼
+[ Postgres            [ Spark Batch Job ]
+  Live Metrics ]             │
+                             ▼
+                    [ Postgres Gold Layer ]
+                             │
+                    [ /data/ Lake ]
+                    landing/ → bronze/ → gold/
 ```
 
-**Key design decision:** Airflow is never in the synchronous ingestion path. Kafka absorbs all incoming traffic; Airflow only orchestrates scheduled batch jobs.
+**Key design decision:** Airflow is never in the synchronous ingestion path. Kafka absorbs all incoming traffic; Airflow only orchestrates scheduled batch jobs and data quality checks.
 
 ---
 
@@ -41,14 +32,12 @@ A production-grade, end-to-end data engineering platform built from scratch. Cov
 
 | Layer | Technology |
 |---|---|
-| API Gateway | FastAPI + asyncpg + Pydantic v2 |
 | Message Queue | Apache Kafka (KRaft, no Zookeeper) |
 | Stream Processing | Apache Spark Structured Streaming |
-| Batch Orchestration | Apache Airflow 2.9 |
+| Batch Orchestration | Apache Airflow 2.9 (LocalExecutor) |
 | Distributed Compute | Apache Spark 3.5 (1 master + 2 workers) |
 | Database | PostgreSQL 15 |
-| Frontend | React 18 + TypeScript + Vite + Recharts |
-| Infrastructure | Docker Compose + Nginx reverse proxy |
+| Infrastructure | Docker Compose |
 | CI/CD | GitHub Actions |
 
 ---
@@ -57,39 +46,25 @@ A production-grade, end-to-end data engineering platform built from scratch. Cov
 
 ```
 FlowStack/
-├── .github/workflows/ci.yml       # CI: lint, type-check, DAG validation, Docker build
-├── backend/                       # FastAPI async gateway
-│   └── app/
-│       ├── core/                  # Config, DB connection pool
-│       ├── models/                # SQLAlchemy ORM models
-│       ├── schemas/               # Pydantic v2 validation
-│       ├── services/              # Kafka producer, WebSocket manager
-│       └── routers/               # API endpoints
+├── .github/workflows/ci.yml          # CI: DAG validation, Spark lint
 ├── airflow/
-│   ├── dags/
-│   │   ├── batch_etl_pipeline.py  # Idempotent hourly ETL
-│   │   └── dynamic_dag_factory.py # Auto-generates DAGs from JSON config
+│   ├── dags/                         # 26 production DAGs (see catalogue below)
 │   ├── config/
-│   │   └── central_tenant_manifest.json
-│   └── plugins/alerts.py          # Slack/Discord failure hooks
+│   │   └── central_tenant_manifest.json  # Config-driven multi-tenant DAG factory
+│   └── plugins/alerts.py             # Slack/Discord failure hooks
 ├── spark/
 │   ├── apps/
-│   │   ├── metrics_aggregation.py # Batch: landing → gold
-│   │   ├── streaming_consumer.py  # Streaming: Kafka → Postgres live metrics
-│   │   └── tenant_job.py          # Multi-tenant batch processor
-│   └── core/                      # Shared schemas + validation helpers
-├── frontend/
-│   └── src/
-│       ├── components/            # StatCard, BarChart, PipelineTable
-│       └── hooks/                 # useMetricsWebSocket, usePipelineStatus
+│   │   ├── metrics_aggregation.py    # Batch: landing → gold aggregation
+│   │   ├── streaming_consumer.py     # Streaming: Kafka → Postgres live metrics
+│   │   └── tenant_job.py             # Multi-tenant batch processor
+│   └── core/                         # Shared schemas + validation helpers
 ├── docker/
-│   ├── postgres/init.sql          # Schema, indexes (composite + GIN)
-│   ├── nginx/nginx.conf           # Reverse proxy + WebSocket upgrade
-│   └── spark-cluster/             # Spark tuning config
+│   ├── postgres/init.sql             # Schema, indexes (composite + GIN)
+│   └── spark-cluster/                # Spark tuning config
 ├── data/
-│   ├── landing/                   # Raw Parquet dumps (immutable)
-│   ├── bronze/                    # Validated records
-│   └── gold/                      # Aggregated analytics tables
+│   ├── landing/                      # Raw Parquet dumps (immutable, hourly)
+│   ├── bronze/                       # Validated records
+│   └── gold/                         # Aggregated analytics output
 └── docker-compose.yml
 ```
 
@@ -114,68 +89,122 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-First run takes ~15 minutes (downloading Spark, Airflow, Kafka images). Subsequent starts take under 30 seconds.
+First run takes ~10–15 minutes (downloading Spark, Airflow, Kafka images). Subsequent starts take under 30 seconds.
 
 ### 3. Open the services
 
 | Service | URL | Credentials |
 |---|---|---|
-| **React Dashboard** | http://localhost:8090 | — |
-| **API Docs (Swagger)** | http://localhost:8001/docs | — |
-| **Airflow UI** | http://localhost:8083 | `admin` / `admin` |
+| **Airflow UI** | http://localhost:8080 | `admin` / `admin` |
 | **Spark Master UI** | http://localhost:8082 | — |
-| **API Health** | http://localhost:8001/health | — |
+| **Postgres** | `localhost:5433` | `engine_admin` / see `.env` |
+
+### 4. Verify DAGs loaded
+
+```bash
+docker exec airflow_scheduler airflow dags list
+docker exec airflow_scheduler airflow dags list-import-errors
+```
+
+Expected: 26 DAGs listed, 0 import errors.
 
 ---
 
-## Using the Platform
+## DAG Catalogue
 
-### Create a user
+### Core ETL (2 DAGs)
 
-```bash
-curl -X POST http://localhost:8001/api/v1/users/ \
-  -H "Content-Type: application/json" \
-  -d '{"email": "demo@flowstack.com", "password": "password123"}'
-```
+| DAG | Schedule | Description |
+|---|---|---|
+| `batch_etl_pipeline` | Hourly | Idempotent extract from Postgres → Parquet landing → Spark gold. The foundation DAG. |
+| `dynamic_dag_factory` | Per-tenant | Reads `central_tenant_manifest.json` and auto-generates one DAG per tenant — no Python changes needed to add a client. |
 
-Copy the `id` from the response.
+### Data Quality (5 DAGs)
 
-### Send events
+| DAG | Schedule | Description |
+|---|---|---|
+| `dq_null_check_pipeline` | Hourly | BranchPythonOperator: if null % > threshold → quarantine, else pass gate. |
+| `dq_schema_drift_detector` | Daily | ShortCircuitOperator: compares current Parquet schema against a snapshot; alerts on column additions/removals/type changes. |
+| `dq_row_count_sla_check` | Daily | `depends_on_past=True` + `sla=timedelta()`: enforces a minimum row count and fires an SLA miss callback if breached. |
+| `dq_event_type_distribution` | Daily | XCom chaining: computes today's event-type distribution in parallel, then compares against yesterday's baseline. |
+| `dq_duplicate_detection` | Hourly | PostgresOperator with `ROW_NUMBER() OVER (PARTITION BY ...)` window function to identify and stage duplicate events. |
 
-```bash
-# Replace USER_ID with the id you just got
-curl -X POST http://localhost:8001/api/v1/events/ingest \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"USER_ID","eventType":"purchase","productId":101}'
-```
+### Reporting (4 DAGs)
 
-Supported event types: `purchase`, `view`, `add_to_cart`, `checkout`, `refund`
+| DAG | Schedule | Description |
+|---|---|---|
+| `daily_event_summary_report` | Daily 01:00 | Aggregates yesterday's events by hour + type into `daily_event_summary`. Uses `{{ yesterday_ds }}` / `{{ ds }}` Jinja macros. |
+| `weekly_user_cohort_report` | Weekly Mon 06:00 | Joins raw_events → users → user_cohorts; uses `{{ macros.ds_add(ds, -7) }}` for the 7-day lookback window. |
+| `monthly_revenue_kpi_report` | Monthly 1st 07:00 | Computes MoM revenue KPIs, then fires `TriggerDagRunOperator` (fire-and-forget) to archive old users. |
+| `tenant_aggregated_report` | Daily 04:00 | Dynamic task generation: for-loop at parse time creates one `PythonOperator` per tenant — fan-out → fan-in. |
 
-Send a few events with different types and watch the dashboard at http://localhost:8090 update in real time via WebSocket.
+### Data Lifecycle (5 DAGs)
 
-### Trigger a batch pipeline
+| DAG | Schedule | Description |
+|---|---|---|
+| `cleanup_landing_zone` | Daily 02:00 | Deletes Parquet files older than `LANDING_RETENTION_DAYS` (env var, default 30). ShortCircuit guard if empty. |
+| `cleanup_old_live_metrics` | Daily 03:00 | Batched deletes from `live_event_metrics`; runs `VACUUM ANALYZE` via asyncpg autocommit (cannot run inside a transaction). |
+| `bronze_to_gold_compaction` | Daily 00:30 | `depends_on_past=True`: compacts yesterday's bronze Parquet into optimised gold partitions. Logs to `compaction_manifest`. |
+| `archive_and_purge_users` | On-trigger | Guard-before-delete pattern: exports inactive users to Parquet archive first, then soft-deletes. |
+| `hourly_live_metrics_rollup` | Hourly | ShortCircuitOperator guards empty streaming windows; rolls up `live_event_metrics` into hourly summaries. |
 
-In Airflow (http://localhost:8083), click `batch_etl_pipeline_v1` → **▶ Trigger DAG**. This runs the full extract → Spark transform → gold layer write cycle.
+### Monitoring (6 DAGs)
+
+| DAG | Schedule | Description |
+|---|---|---|
+| `pipeline_health_monitor` | Every 3h | `ExternalTaskSensor` (mode="reschedule") waits for `batch_etl_pipeline` completion, then runs health checks. |
+| `kafka_consumer_lag_monitor` | Every 30min | BashOperator stdout → XCom: runs `kafka-consumer-groups.sh`, parses lag, alerts if above threshold. |
+| `spark_cluster_health_check` | Hourly | HTTP requests to Spark master REST API (`http://spark-master:8080/json/`); checks worker count and memory. |
+| `data_freshness_sla_tracker` | Hourly | Measures time since last event in Postgres + age of newest gold Parquet file; alerts on stale data. |
+| `failed_task_audit_reporter` | Daily 06:00 | Queries Airflow's own `task_instance` table (read-only) to report all failed tasks in the past 24 hours. |
+| `event_ingestion_error_tracker` | Hourly | Bootstraps `ingestion_errors` table and aggregates error counts by type for observability. |
+
+### Advanced Orchestration (4 DAGs)
+
+| DAG | Schedule | Description |
+|---|---|---|
+| `dlq_replay_pipeline` | Every 6h | ShortCircuitOperator + Kafka consumer: replays events from the dead-letter queue, offset-safe. |
+| `conditional_spark_backfill_orchestrator` | Daily 05:00 | Scans `/data/landing/` for missing date partitions, then triggers `TriggerDagRunOperator` per gap (`wait_for_completion=True`), sequentially oldest-first. |
+| `multi_sensor_coordination_pipeline` | Every 3h | Two parallel `ExternalTaskSensor`s (AND-join): waits for both core ETL and Nike tenant ETL before running a cross-pipeline Spark join. |
+| `adaptive_schedule_etl` | Hourly | Self-aware pipeline: reads its own `pipeline_run_log` history. If last 3 runs all had low row counts → full 24h reprocess; otherwise incremental 1h load. |
+
+---
+
+## Key Airflow Concepts Demonstrated
+
+| Concept | Where |
+|---|---|
+| `BranchPythonOperator` — returns task_id string to pick a branch | `dq_null_check_pipeline`, `adaptive_schedule_etl`, `conditional_spark_backfill_orchestrator` |
+| `ShortCircuitOperator` — returns bool; False → downstream SKIPPED | `dq_schema_drift_detector`, `cleanup_landing_zone`, `dlq_replay_pipeline` |
+| `ExternalTaskSensor` with `mode="reschedule"` — critical for LocalExecutor | `pipeline_health_monitor`, `multi_sensor_coordination_pipeline` |
+| `TriggerDagRunOperator` with `wait_for_completion=True/False` | `monthly_revenue_kpi_report`, `conditional_spark_backfill_orchestrator` |
+| Dynamic task generation (for-loop at parse time) | `tenant_aggregated_report`, `conditional_spark_backfill_orchestrator` |
+| `depends_on_past=True` — sequential run safety | `dq_row_count_sla_check`, `bronze_to_gold_compaction` |
+| `sla=timedelta()` + `sla_miss_callback` | `dq_row_count_sla_check` |
+| XCom chaining across tasks | `dq_event_type_distribution`, `kafka_consumer_lag_monitor` |
+| Jinja macros: `{{ ds }}`, `{{ yesterday_ds }}`, `{{ macros.ds_add() }}` | Reporting DAGs, `batch_etl_pipeline` |
+| `trigger_rule="none_failed_min_one_success"` for branch convergence | All branching DAGs |
+| asyncpg autocommit for `VACUUM ANALYZE` | `cleanup_old_live_metrics` |
+| `PostgresOperator` with window functions in SQL | `dq_duplicate_detection` |
 
 ---
 
 ## How It Works
 
-### Real-time path (sub-second)
-1. `POST /api/v1/events/ingest` — FastAPI validates the payload with Pydantic
-2. Event is produced to the `user-events` Kafka topic (acks=all, gzip compressed)
-3. FastAPI broadcasts a WebSocket notification to all connected dashboard clients
-4. Dashboard updates instantly — no HTTP polling
-
-### Batch path (hourly)
-1. Airflow `batch_etl_pipeline_v1` wakes up on schedule
-2. Extracts events from Postgres for the closed time window `[start, end)` — idempotent by design
+### Batch path (hourly, core pipeline)
+1. Airflow `batch_etl_pipeline` wakes up on schedule
+2. Extracts events from Postgres for the closed time window `[data_interval_start, data_interval_end)` — idempotent by design
 3. Writes Parquet files to `/data/landing/YYYY/MM/DD/HH/`
 4. Submits a PySpark job to the Spark cluster
 5. Spark reads landing Parquet, aggregates by product, writes to `/data/gold/`
 
+### Streaming path (continuous)
+1. Events arrive in the `user-events` Kafka topic
+2. Spark Structured Streaming (`streaming_consumer.py`) reads from Kafka in micro-batches
+3. Writes aggregated metrics to `live_event_metrics` table in Postgres
+
 ### Dead Letter Queue
-Any event that fails Kafka validation is routed to `user-events-dlq` instead of being dropped. Nothing is silently lost.
+Any event that fails validation is routed to `user-events-dlq`. The `dlq_replay_pipeline` DAG periodically replays these — nothing is silently lost.
 
 ### Dynamic DAG Factory
 Adding a new tenant requires only a JSON entry in `airflow/config/central_tenant_manifest.json` — no Python code changes:
@@ -198,9 +227,16 @@ Adding a new tenant requires only a JSON entry in `airflow/config/central_tenant
 docker compose ps
 
 # Tail logs for a specific service
-docker compose logs -f api-gateway
-docker compose logs -f kafka-broker
 docker compose logs -f airflow-scheduler
+docker compose logs -f kafka-broker
+docker compose logs -f spark-master
+
+# Trigger a DAG manually
+docker exec airflow_scheduler airflow dags trigger batch_etl_pipeline
+
+# List all DAGs and check for import errors
+docker exec airflow_scheduler airflow dags list
+docker exec airflow_scheduler airflow dags list-import-errors
 
 # List Kafka topics
 docker exec production_kafka kafka-topics \
@@ -209,9 +245,6 @@ docker exec production_kafka kafka-topics \
 # Connect to Postgres
 docker exec -it production_postgres \
   psql -U engine_admin -d analytics_platform
-
-# Restart a single service after a code change
-docker compose restart api-gateway
 
 # Full teardown (removes volumes/data)
 docker compose down -v
@@ -225,24 +258,21 @@ GitHub Actions runs on every push to `main` and every pull request:
 
 | Job | What it checks |
 |---|---|
-| `backend` | ruff lint + pytest (against real Postgres) |
+| `airflow` | Imports all 26 DAGs — zero broken DAGs required to pass |
 | `spark` | ruff lint on all PySpark jobs |
-| `airflow` | DAG import validation (no broken DAGs) |
-| `frontend` | TypeScript type-check + Vite production build |
-| `docker-build` | Builds all 4 Docker images (runs after all above pass) |
 
 ---
 
 ## Learning Path
 
-This project was built phase by phase:
+This project was built phase by phase, focused on the data engineering layer:
 
 | Phase | What was built |
 |---|---|
-| 1–2 | FastAPI gateway, PostgreSQL schema, asyncpg pool |
-| 3–4 | Modular ETL scripts, idempotent Airflow DAGs |
-| 5 | Dynamic DAG factory (config-driven, no code changes per tenant) |
-| 6 | Spark cluster, distributed batch PySpark jobs |
-| 7 | Kafka integration, Spark Structured Streaming |
-| 8 | React dashboard, WebSocket live feed, Recharts |
-| 9–11 | Multi-stage Dockerfiles, Nginx proxy, GitHub Actions CI/CD |
+| 1–2 | PostgreSQL schema, asyncpg connection pool, Kafka KRaft setup |
+| 3–4 | Idempotent hourly ETL DAG, Parquet landing zone, Spark batch jobs |
+| 5 | Dynamic DAG factory — config-driven, no code changes per tenant |
+| 6 | Full Spark cluster (1 master + 2 workers), distributed PySpark jobs |
+| 7 | Kafka integration, Spark Structured Streaming consumer |
+| 8–9 | 24 additional DAGs across DQ, reporting, lifecycle, monitoring, orchestration |
+| 10–11 | Multi-stage Dockerfiles, GitHub Actions CI/CD, DAG import validation |
